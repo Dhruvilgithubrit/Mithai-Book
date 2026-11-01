@@ -23,7 +23,7 @@ function formatTime(isoString) {
 }
 
 function formatINR(amount) {
-  return Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })
+  return Number(amount || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })
 }
 
 // ── Component ─────────────────────────────────────────────────────────────
@@ -34,6 +34,8 @@ export default function DashboardPage() {
   const [todaySales,       setTodaySales]       = useState([])
   const [recentSales,      setRecentSales]      = useState([])
   const [counterItems,     setCounterItems]     = useState([])
+  const [activeOrders,     setActiveOrders]     = useState([])
+  const [todayRecon,       setTodayRecon]       = useState(null)
   const [loading,          setLoading]          = useState(true)
   const [error,            setError]            = useState('')
 
@@ -49,6 +51,14 @@ export default function DashboardPage() {
   const lowStockItems = counterItems.filter((i) => Number(i.current_stock_kg) <= 1.0)
   const outOfStockItems = counterItems.filter((i) => Number(i.current_stock_kg) === 0)
 
+  // Expiry check
+  const todayStr = todayISO()
+  const expiredItems = counterItems.filter((i) => i.expiry_date && i.expiry_date < todayStr && Number(i.current_stock_kg) > 0)
+  const expiringTodayItems = counterItems.filter((i) => i.expiry_date && i.expiry_date === todayStr && Number(i.current_stock_kg) > 0)
+
+  // Orders stats
+  const totalBalanceDue = activeOrders.reduce((s, o) => s + Number(o.balance_amount), 0)
+
   // ── Fetch all data ────────────────────────────────────────────────────
   const fetchAll = useCallback(async () => {
     if (!user) return
@@ -58,7 +68,7 @@ export default function DashboardPage() {
       const todayStart = `${today}T00:00:00`
       const todayEnd   = `${today}T23:59:59`
 
-      const [todaySalesRes, recentSalesRes, itemsRes] = await Promise.all([
+      const [todaySalesRes, recentSalesRes, itemsRes, ordersRes, reconRes] = await Promise.all([
         supabase
           .from('sales')
           .select('id, total_amount, payment_mode, note, sale_date, sale_items(item_name, qty_kg, line_total)')
@@ -76,19 +86,36 @@ export default function DashboardPage() {
 
         supabase
           .from('counter_items')
-          .select('id, name, current_stock_kg, price_per_kg')
+          .select('id, name, current_stock_kg, price_per_kg, shelf_life_days, expiry_date')
           .eq('shop_id', user.id)
           .eq('is_active', true)
           .order('current_stock_kg', { ascending: true }),
+
+        supabase
+          .from('advance_orders')
+          .select('id, customer_name, pickup_date, balance_amount, status')
+          .eq('shop_id', user.id)
+          .neq('status', 'Delivered'),
+
+        supabase
+          .from('daily_reconciliations')
+          .select('id, recon_date, actual_cash, difference')
+          .eq('shop_id', user.id)
+          .eq('recon_date', today)
+          .maybeSingle(),
       ])
 
       if (todaySalesRes.error) throw todaySalesRes.error
       if (recentSalesRes.error) throw recentSalesRes.error
       if (itemsRes.error) throw itemsRes.error
+      if (ordersRes.error) throw ordersRes.error
+      if (reconRes.error) throw reconRes.error
 
       setTodaySales(todaySalesRes.data || [])
       setRecentSales(recentSalesRes.data || [])
       setCounterItems(itemsRes.data || [])
+      setActiveOrders(ordersRes.data || [])
+      setTodayRecon(reconRes.data)
     } catch (err) {
       console.error('Dashboard fetch error:', err)
       setError('Failed to refresh dashboard. Please check connection.')
@@ -103,7 +130,13 @@ export default function DashboardPage() {
     const channel = supabase
       .channel(`dashboard_sales_${user.id}`)
       .on('postgres_changes', {
-        event: 'INSERT', schema: 'public', table: 'sales',
+        event: '*', schema: 'public', table: 'sales',
+        filter: `shop_id=eq.${user.id}`,
+      }, () => {
+        fetchAll()
+      })
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'advance_orders',
         filter: `shop_id=eq.${user.id}`,
       }, () => {
         fetchAll()
@@ -175,24 +208,115 @@ export default function DashboardPage() {
             </h1>
             <p className="text-gray-500 text-xs mt-1">{todayLabel}</p>
           </div>
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0 flex-wrap">
             <button
               onClick={fetchAll}
               title="Refresh dashboard"
-              className="btn-secondary text-sm px-3.5 py-2"
+              className="btn-secondary text-xs sm:text-sm px-3 py-2"
             >
               <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
-              <span className="text-xs text-gray-600 font-medium">Refresh</span>
+              <span className="hidden sm:inline text-xs text-gray-600 font-medium">Refresh</span>
             </button>
-            <Link to="/sale" className="btn-primary text-sm font-semibold flex items-center gap-2">
+            <Link to="/orders/new" className="btn-secondary text-xs sm:text-sm px-3.5 py-2 font-semibold">
+              + Advance Order
+            </Link>
+            <Link to="/sale" className="btn-primary text-xs sm:text-sm font-semibold flex items-center gap-1.5 py-2">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
               </svg>
-              <span>New Sale</span>
+              <span>Quick Sale</span>
             </Link>
           </div>
+        </div>
+
+        {/* ── Operational Status Banner (Orders / Expiry / Closing) ───── */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5 mb-6">
+          {/* Advance Orders Banner */}
+          <Link
+            to="/orders"
+            className="p-3.5 rounded-xl border border-gray-200 bg-white hover:border-orange-300 hover:shadow-xs transition-all flex items-center justify-between"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-lg bg-orange-50 text-orange-600 flex items-center justify-center font-bold text-xs">
+                {activeOrders.length}
+              </div>
+              <div>
+                <p className="text-xs font-bold text-gray-900 leading-tight">Advance Orders</p>
+                <p className="text-[11px] text-gray-500">
+                  {activeOrders.length === 0
+                    ? 'No pending orders'
+                    : `₹${formatINR(totalBalanceDue)} balance to collect`}
+                </p>
+              </div>
+            </div>
+            <span className="text-xs text-orange-600 font-semibold">View →</span>
+          </Link>
+
+          {/* Expiry Banner */}
+          <Link
+            to="/expiry"
+            className={`p-3.5 rounded-xl border transition-all flex items-center justify-between ${
+              expiredItems.length > 0
+                ? 'bg-red-50/50 border-red-200 hover:border-red-300'
+                : expiringTodayItems.length > 0
+                ? 'bg-amber-50/50 border-amber-200 hover:border-amber-300'
+                : 'bg-white border-gray-200 hover:border-gray-300'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <div
+                className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs ${
+                  expiredItems.length > 0
+                    ? 'bg-red-100 text-red-700'
+                    : expiringTodayItems.length > 0
+                    ? 'bg-amber-100 text-amber-700'
+                    : 'bg-gray-100 text-gray-600'
+                }`}
+              >
+                {expiredItems.length + expiringTodayItems.length}
+              </div>
+              <div>
+                <p className="text-xs font-bold text-gray-900 leading-tight">Shelf Life Alerts</p>
+                <p className="text-[11px] text-gray-500">
+                  {expiredItems.length > 0
+                    ? `${expiredItems.length} items expired on tray`
+                    : expiringTodayItems.length > 0
+                    ? `${expiringTodayItems.length} items expiring today`
+                    : 'All sweets well within shelf life'}
+                </p>
+              </div>
+            </div>
+            <span className="text-xs text-orange-600 font-semibold">Check →</span>
+          </Link>
+
+          {/* Daily Closing Banner */}
+          <Link
+            to="/reconcile"
+            className="p-3.5 rounded-xl border border-gray-200 bg-white hover:border-gray-300 hover:shadow-xs transition-all flex items-center justify-between"
+          >
+            <div className="flex items-center gap-3">
+              <div
+                className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs ${
+                  todayRecon ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-600'
+                }`}
+              >
+                {todayRecon ? '✓' : '₹'}
+              </div>
+              <div>
+                <p className="text-xs font-bold text-gray-900 leading-tight">Day's Drawer Closing</p>
+                <p className="text-[11px] text-gray-500">
+                  {todayRecon
+                    ? `Balanced (₹${formatINR(todayRecon.actual_cash)} counted)`
+                    : 'Drawer count pending for tonight'}
+                </p>
+              </div>
+            </div>
+            <span className="text-xs text-orange-600 font-semibold">
+              {todayRecon ? 'Details →' : 'Reconcile →'}
+            </span>
+          </Link>
         </div>
 
         {/* ── Loading skeleton ──────────────────────────────────────── */}
@@ -280,7 +404,7 @@ export default function DashboardPage() {
 
             </div>
 
-            {/* ── ROW 2: Top Selling & Stock Alerts Side by Side ── */}
+            {/* ── ROW 2: Top Items & Stock Alerts Side by Side ── */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
 
               {/* Top-Selling Items Today */}
@@ -339,7 +463,7 @@ export default function DashboardPage() {
                     <svg className="w-5 h-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                     </svg>
-                    <h2 className="font-bold text-gray-900 text-base">Stock Alerts</h2>
+                    <h2 className="font-bold text-gray-900 text-base">Low Stock Warnings</h2>
                   </div>
                   <Link
                     to="/counter"
@@ -356,7 +480,7 @@ export default function DashboardPage() {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
                       </svg>
                     </div>
-                    <p className="text-sm font-semibold text-emerald-700">All items well-stocked</p>
+                    <p className="text-sm font-semibold text-emerald-700">All trays well-stocked</p>
                     <p className="text-xs text-gray-500 mt-0.5">No critical stock warnings right now</p>
                   </div>
                 ) : (
@@ -434,7 +558,7 @@ export default function DashboardPage() {
                       <Link
                         key={item.id}
                         to="/counter"
-                        className="p-3 rounded-lg border border-gray-200 bg-white hover:border-orange-300 hover:shadow-sm transition-all flex flex-col justify-between"
+                        className="p-3 rounded-lg border border-gray-200 bg-white hover:border-orange-300 hover:shadow-xs transition-all flex flex-col justify-between"
                       >
                         <span className="text-xs font-semibold text-gray-900 truncate">
                           {item.name}
